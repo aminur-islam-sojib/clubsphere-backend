@@ -65,24 +65,37 @@ function verifyJWT(req, res, next) {
 }
 
 // Update Member Role Api
-
 const updateUser = async (req, res, next) => {
   try {
-    const email = req.user && req.user.email;
-    if (!email) {
-      console.log("updateUser: no email in token, skipping role update");
+    const email = req.user?.email;
+    if (!email) return next();
+
+    // 1. Get current user from DB
+    const user = await Users.findOne({ email });
+
+    if (!user) {
+      console.log("User not found");
       return next();
     }
 
-    const updateData = { role: "manager" };
-    const result = await Users.updateOne({ email }, { $set: updateData });
+    // 2. Prevent overwriting admin role
+    if (user.role === "admin") {
+      console.log("User is admin — role will not change");
+      return next();
+    }
 
-    if (result.modifiedCount === 0) {
-      console.log("updateUser: user not found or nothing changed for", email);
-    } else {
-      console.log("updateUser: role updated to manager for", email);
-      // Update the req.user object so subsequent middleware sees the new role
+    // 3. If user is already manager, do not update
+    if (user.role === "manager") {
+      console.log("User already manager — no update needed");
+      return next();
+    }
+
+    // 4. If user is member, upgrade to manager
+    if (user.role === "member") {
+      await Users.updateOne({ email }, { $set: { role: "manager" } });
+
       req.user.role = "manager";
+      console.log("Role updated to manager for", email);
     }
 
     next();
@@ -106,11 +119,15 @@ function verifyRole(role) {
 // --------------------------------------------------
 // AUTH API
 // --------------------------------------------------
-app.post("/api/auth/jwt", (req, res) => {
-  const { email, name, role, photoURL } = req.body;
+app.post("/api/auth/jwt", async (req, res) => {
+  const { email } = req.body;
+
+  const user = await Users.findOne({ email });
+
+  if (!user) return res.status(404).json({ message: "User not found" });
 
   const token = jwt.sign(
-    { email, name, role: role || "member", photoURL },
+    { email: user.email, name: user.name, role: user.role },
     JWT_SECRET
   );
 
@@ -282,29 +299,24 @@ app.get("/api/clubs/:id", async (req, res) => {
 });
 
 // Admin – Approve club
-app.patch(
-  "/api/clubs/approve/:id",
-  verifyJWT,
-  verifyRole("admin"),
-  async (req, res) => {
-    try {
-      await Clubs.updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { status: "approved" } }
-      );
+app.patch("/api/clubs/approve/:id", verifyJWT, async (req, res) => {
+  try {
+    await Clubs.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status: "approved" } }
+    );
 
-      res.json({ message: "Club approved!" });
-    } catch (err) {
-      res.status(500).json({ message: "Error approving club", error: err });
-    }
+    res.json({ message: "Club approved!" });
+  } catch (err) {
+    res.status(500).json({ message: "Error approving club", error: err });
   }
-);
+});
 
 // Admin – Reject club
 app.patch(
   "/api/clubs/reject/:id",
   verifyJWT,
-  verifyRole("admin"),
+
   async (req, res) => {
     try {
       await Clubs.updateOne(
