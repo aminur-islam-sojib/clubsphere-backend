@@ -111,8 +111,7 @@ app.post("/api/auth/jwt", (req, res) => {
 
   const token = jwt.sign(
     { email, name, role: role || "member", photoURL },
-    JWT_SECRET,
-    { expiresIn: "1d" }
+    JWT_SECRET
   );
 
   return res.json({ token });
@@ -247,6 +246,24 @@ app.get("/api/clubs", async (req, res) => {
     const clubs = await Clubs.find({ status: "approved" }).toArray();
     res.json(clubs);
   } catch (err) {
+    res.status(500).json({ message: "Error fetching clubs", error: err });
+  }
+});
+
+app.get("/api/clubs/pending/:role/:email", verifyJWT, async (req, res) => {
+  if (req.params.email !== req.user.email) {
+    return res.status(500).json({ message: "Unauthorized Access" });
+  }
+  if (req.params.role !== "admin") {
+    return res.status(500).json({ message: "Unauthorized Access" });
+  }
+  const query = {
+    status: "pending",
+  };
+  try {
+    const pendingClub = await Clubs.find(query).toArray();
+    res.json(pendingClub);
+  } catch (error) {
     res.status(500).json({ message: "Error fetching clubs", error: err });
   }
 });
