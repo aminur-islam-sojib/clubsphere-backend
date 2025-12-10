@@ -47,6 +47,9 @@ dbConnect();
 function verifyJWT(req, res, next) {
   const authHeader = req.headers.authorization;
 
+  const users = req.body;
+  console.log(users);
+
   if (!authHeader)
     return res.status(401).json({ message: "Unauthorized: No token provided" });
 
@@ -167,6 +170,14 @@ app.get("/api/users/me", verifyJWT, async (req, res) => {
 
 // Create Club
 app.post("/api/clubs", verifyJWT, async (req, res) => {
+  const decoded_email = req.user.email;
+  const creatorEmail = req.body.managerEmail;
+  console.log(decoded_email, creatorEmail);
+
+  if (decoded_email !== creatorEmail) {
+    res.status(403).json({ message: "Unauthorized email" });
+  }
+
   try {
     const clubData = {
       ...req.body,
