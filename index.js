@@ -105,7 +105,7 @@ app.post("/api/users", async (req, res) => {
     const newUser = {
       email,
       name,
-      password, // Note: In production, this should be hashed
+      password,
       role: "member",
       createdAt: new Date(),
     };
@@ -113,6 +113,22 @@ app.post("/api/users", async (req, res) => {
     await Users.insertOne(newUser);
     res.status(201).json({ message: "User created successfully", email });
   } catch (err) {
+    res.status(500).json({ message: "Error creating user", error: err });
+  }
+});
+
+// Get User Role
+app.get("/api/getRole/:email", verifyJWT, async (req, res) => {
+  const userEmail = req.params.email;
+
+  if (req.user.email !== userEmail) {
+    return res.status(500).send("Unauthorized Access");
+  }
+
+  try {
+    const user = await Users.findOne({ email: userEmail });
+    res.json(user);
+  } catch (error) {
     res.status(500).json({ message: "Error creating user", error: err });
   }
 });
@@ -133,7 +149,7 @@ app.get("/api/users", verifyJWT, verifyRole("admin"), async (req, res) => {
 
 // Admin – Update user role
 app.patch(
-  "/api/users/role/:id",
+  "/api/users/role/:email",
   verifyJWT,
   verifyRole("admin"),
   async (req, res) => {
