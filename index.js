@@ -64,6 +64,34 @@ function verifyJWT(req, res, next) {
   }
 }
 
+// Update Member Role Api
+
+const updateUser = async (req, res, next) => {
+  try {
+    const email = req.user && req.user.email;
+    if (!email) {
+      console.log("updateUser: no email in token, skipping role update");
+      return next();
+    }
+
+    const updateData = { role: "manager" };
+    const result = await Users.updateOne({ email }, { $set: updateData });
+
+    if (result.modifiedCount === 0) {
+      console.log("updateUser: user not found or nothing changed for", email);
+    } else {
+      console.log("updateUser: role updated to manager for", email);
+      // Update the req.user object so subsequent middleware sees the new role
+      req.user.role = "manager";
+    }
+
+    next();
+  } catch (error) {
+    console.log("Error updating user role:", error);
+    next(error);
+  }
+};
+
 // --------------------------------------------------
 // ROLE MIDDLEWARE
 // --------------------------------------------------
@@ -155,10 +183,15 @@ app.patch(
   async (req, res) => {
     try {
       const { role } = req.body;
-      await Users.updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { role } }
-      );
+      const email = req.params.email;
+      if (!email)
+        return res.status(400).json({ message: "Missing email parameter" });
+
+      const result = await Users.updateOne({ email }, { $set: { role } });
+      if (result.matchedCount === 0) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
       res.json({ message: "Role updated" });
     } catch (err) {
       res.status(500).json({ message: "Error updating role", error: err });
@@ -185,13 +218,12 @@ app.get("/api/users/me", verifyJWT, async (req, res) => {
 // --------------------------------------------------
 
 // Create Club
-app.post("/api/clubs", verifyJWT, async (req, res) => {
+app.post("/api/clubs", verifyJWT, updateUser, async (req, res) => {
   const decoded_email = req.user.email;
   const creatorEmail = req.body.managerEmail;
-  console.log(decoded_email, creatorEmail);
 
   if (decoded_email !== creatorEmail) {
-    res.status(403).json({ message: "Unauthorized email" });
+    return res.status(403).json({ message: "Unauthorized email" });
   }
 
   try {
