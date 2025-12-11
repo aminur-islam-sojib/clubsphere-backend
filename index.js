@@ -64,52 +64,13 @@ function verifyJWT(req, res, next) {
   }
 }
 
-// Update Member Role Api
-const updateUser = async (req, res, next) => {
-  try {
-    const email = req.user?.email;
-    if (!email) return next();
-
-    // 1. Get current user from DB
-    const user = await Users.findOne({ email });
-
-    if (!user) {
-      console.log("User not found");
-      return next();
-    }
-
-    // 2. Prevent overwriting admin role
-    if (user.role === "admin") {
-      console.log("User is admin — role will not change");
-      return next();
-    }
-
-    // 3. If user is already manager, do not update
-    if (user.role === "manager") {
-      console.log("User already manager — no update needed");
-      return next();
-    }
-
-    // 4. If user is member, upgrade to manager
-    if (user.role === "member") {
-      await Users.updateOne({ email }, { $set: { role: "manager" } });
-
-      req.user.role = "manager";
-      console.log("Role updated to manager for", email);
-    }
-
-    next();
-  } catch (error) {
-    console.log("Error updating user role:", error);
-    next(error);
-  }
-};
-
 // --------------------------------------------------
 // ROLE MIDDLEWARE
 // --------------------------------------------------
 function verifyRole(role) {
   return (req, res, next) => {
+    const user = req.user;
+    console.log(user);
     if (req.user.role !== role)
       return res.status(403).json({ message: "Access denied" });
     next();
@@ -193,17 +154,19 @@ app.get("/api/users", verifyJWT, verifyRole("admin"), async (req, res) => {
 
 // Admin – Update user role
 app.patch(
-  "/api/users/role/:email",
+  "/api/users/update-role/:id",
   verifyJWT,
   verifyRole("admin"),
   async (req, res) => {
     try {
       const { role } = req.body;
-      const email = req.params.email;
-      if (!email)
-        return res.status(400).json({ message: "Missing email parameter" });
+      const id = req.params.id;
+      if (!id) return res.status(400).json({ message: "Missing id parameter" });
 
-      const result = await Users.updateOne({ email }, { $set: { role } });
+      const result = await Users.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { role } }
+      );
       if (result.matchedCount === 0) {
         return res.status(404).json({ message: "User not found" });
       }
@@ -214,7 +177,46 @@ app.patch(
     }
   }
 );
+// Update Member Role Api
+const updateUser = async (req, res, next) => {
+  try {
+    const email = req.user?.email;
+    if (!email) return next();
 
+    // 1. Get current user from DB
+    const user = await Users.findOne({ email });
+
+    if (!user) {
+      console.log("User not found");
+      return next();
+    }
+
+    // 2. Prevent overwriting admin role
+    if (user.role === "admin") {
+      console.log("User is admin — role will not change");
+      return next();
+    }
+
+    // 3. If user is already manager, do not update
+    if (user.role === "manager") {
+      console.log("User already manager — no update needed");
+      return next();
+    }
+
+    // 4. If user is member, upgrade to manager
+    if (user.role === "member") {
+      await Users.updateOne({ email }, { $set: { role: "manager" } });
+
+      req.user.role = "manager";
+      console.log("Role updated to manager for", email);
+    }
+
+    next();
+  } catch (error) {
+    console.log("Error updating user role:", error);
+    next(error);
+  }
+};
 // Logged-in user info
 app.get("/", async (req, res) => {
   res.send("user ok");
@@ -225,6 +227,16 @@ app.get("/api/users/me", verifyJWT, async (req, res) => {
     const user = await Users.findOne({ email: req.user.email });
     res.json(user);
   } catch (err) {
+    res.status(500).json({ message: "Error fetching user", error: err });
+  }
+});
+
+// DELETE User
+app.delete("/api/users/:id", async (req, res) => {
+  try {
+    const result = await Users.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ message: "User Deleted Successfully" });
+  } catch (error) {
     res.status(500).json({ message: "Error fetching user", error: err });
   }
 });
@@ -266,6 +278,26 @@ app.get("/api/clubs", async (req, res) => {
     res.status(500).json({ message: "Error fetching clubs", error: err });
   }
 });
+
+app.get(
+  "/api/clubs/pending/:email",
+  verifyJWT,
+  verifyRole("admin"),
+  async (req, res) => {
+    if (req.params.email !== req.user.email) {
+      return res.status(500).json({ message: "Unauthorized Access" });
+    }
+    const query = {
+      email: email,
+    };
+    try {
+      const pendingClub = await Clubs.find(query);
+      res.json(pendingClub);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching clubs", error: err });
+    }
+  }
+);
 
 app.get("/api/clubs/pending/:role/:email", verifyJWT, async (req, res) => {
   if (req.params.email !== req.user.email) {
