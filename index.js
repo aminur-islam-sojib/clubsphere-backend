@@ -299,6 +299,20 @@ app.get(
   }
 );
 
+app.get(
+  "/api/clubs/approved",
+  verifyJWT,
+  verifyRole("admin"),
+  async (req, res) => {
+    try {
+      const result = await Clubs.find({ status: "approved" }).toArray();
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching clubs", error: err });
+    }
+  }
+);
+
 app.get("/api/clubs/pending/:role/:email", verifyJWT, async (req, res) => {
   if (req.params.email !== req.user.email) {
     return res.status(500).json({ message: "Unauthorized Access" });
