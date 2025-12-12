@@ -269,6 +269,19 @@ app.post("/api/clubs", verifyJWT, updateUser, async (req, res) => {
   }
 });
 
+app.get("/api/clubs/:email", verifyJWT, async (req, res) => {
+  if (req.user.email !== req.params.email) {
+    res.status(500).json({ message: "Unauthorized access!" });
+  }
+  try {
+    const clubs = await Clubs.find({
+      managerEmail: req.params.email,
+    }).toArray();
+    res.json(clubs);
+  } catch (error) {
+    res.status(500).json({ message: "Error fetching clubs", error: err });
+  }
+});
 // Public – List Approved Clubs
 app.get("/api/clubs", async (req, res) => {
   try {
@@ -313,23 +326,28 @@ app.get(
   }
 );
 
-app.get("/api/clubs/pending/:role/:email", verifyJWT, async (req, res) => {
-  if (req.params.email !== req.user.email) {
-    return res.status(500).json({ message: "Unauthorized Access" });
+app.get(
+  "/api/clubs/pending/:role/:email",
+  verifyJWT,
+  verifyRole("admin"),
+  async (req, res) => {
+    if (req.params.email !== req.user.email) {
+      return res.status(500).json({ message: "Unauthorized Access" });
+    }
+    if (req.params.role !== "admin") {
+      return res.status(500).json({ message: "Unauthorized Access" });
+    }
+    const query = {
+      status: "pending",
+    };
+    try {
+      const pendingClub = await Clubs.find(query).toArray();
+      res.json(pendingClub);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching clubs", error: err });
+    }
   }
-  if (req.params.role !== "admin") {
-    return res.status(500).json({ message: "Unauthorized Access" });
-  }
-  const query = {
-    status: "pending",
-  };
-  try {
-    const pendingClub = await Clubs.find(query).toArray();
-    res.json(pendingClub);
-  } catch (error) {
-    res.status(500).json({ message: "Error fetching clubs", error: err });
-  }
-});
+);
 
 // Get club details
 app.get("/api/clubs/:id", async (req, res) => {
