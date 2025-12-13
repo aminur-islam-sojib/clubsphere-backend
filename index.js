@@ -4,6 +4,8 @@ import jwt from "jsonwebtoken";
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
 dotenv.config();
+import Stripe from "stripe";
+const stripe = new Stripe(process.env.STRIPE_SECRET);
 
 // --------------------------------------------------
 // CONFIG
@@ -76,6 +78,42 @@ function verifyRole(role) {
     next();
   };
 }
+
+// --------------------------------------------------
+// PAYMENT INTEGRATION
+// --------------------------------------------------
+
+const YOUR_DOMAIN = process.env.BASE_DOMAIN || "http://localhost:5173";
+
+app.post("/api/create-checkout-session", verifyJWT, async (req, res) => {
+  const { clubName, email, cost, clubId, description } = req.body;
+  const amount = parseInt(cost) * 100;
+  const session = await stripe.checkout.sessions.create({
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: amount,
+          product_data: {
+            name: clubName,
+            description: description,
+          },
+        },
+        quantity: 1,
+      },
+    ],
+    customer_email: email,
+    mode: "payment",
+    metadata: {
+      productId: clubId,
+    },
+    success_url: `${YOUR_DOMAIN}/dashboard/payment-success`,
+    cancel_url: `${YOUR_DOMAIN}/dashboard/payment-cancel`,
+  });
+
+  console.log(session);
+  res.send(session.url);
+});
 
 // --------------------------------------------------
 // AUTH API
