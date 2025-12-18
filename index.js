@@ -8,40 +8,6 @@ import Stripe from "stripe";
 const stripe = new Stripe(process.env.STRIPE_SECRET);
 import admin from "firebase-admin";
 
-// Initialize Firebase Admin (only if credentials are available)
-let firebaseInitialized = false;
-try {
-  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
-    const serviceAccount = {
-      type: "service_account",
-      project_id: process.env.FIREBASE_PROJECT_ID,
-      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-      private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      client_id: process.env.FIREBASE_CLIENT_ID,
-      auth_uri: "https://accounts.google.com/o/oauth2/auth",
-      token_uri: "https://oauth2.googleapis.com/token",
-      auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-      client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
-    };
-
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-    firebaseInitialized = true;
-    console.log("Firebase Admin initialized successfully");
-  } else {
-    console.log(
-      "Firebase Admin credentials not found, using JWT-only authentication"
-    );
-  }
-} catch (error) {
-  console.log(
-    "Firebase Admin initialization failed, using JWT-only authentication:",
-    error.message
-  );
-}
-
 // --------------------------------------------------
 // CONFIG
 // --------------------------------------------------
@@ -61,7 +27,7 @@ let Users, Clubs, Memberships, Events, Registrations, Payments;
 
 async function dbConnect() {
   try {
-    // await client.connect();
+    await client.connect();
     const db = client.db("clubsphereDB");
 
     Users = db.collection("users");
@@ -78,8 +44,10 @@ async function dbConnect() {
 }
 dbConnect();
 
-// Export the app for serverless deployment
-export default app;
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
 
 // --------------------------------------------------
 // JWT MIDDLEWARE
@@ -691,7 +659,7 @@ app.get(
       return res.status(500).json({ message: "Unauthorized Access" });
     }
     const query = {
-      status: "pending",
+      email: email,
     };
     try {
       const pendingClub = await Clubs.find(query);
@@ -808,17 +776,6 @@ app.patch("/api/club/:id", verifyJWT, async (req, res) => {
   }
 });
 
-app.delete("/api/club/:id", verifyJWT, async (req, res) => {
-  try {
-    const club = await Clubs.deleteOne({ _id: new ObjectId(req.params.id) });
-    if (!club) {
-      return res.status(404).json({ message: "Club not found" });
-    }
-    res.json(club);
-  } catch (err) {
-    res.status(500).json({ message: "Error fetching club", error: err });
-  }
-});
 // --------------------------------------------------
 // MEMBERSHIP API
 // --------------------------------------------------
@@ -858,9 +815,8 @@ app.post("/api/events", verifyJWT, async (req, res) => {
     const event = {
       ...req.body,
       createdAt: new Date(),
-      clubId: new ObjectId(req.body.clubId),
     };
-    console.log(event);
+
     await Events.insertOne(event);
     res.json({ message: "Event created!" });
   } catch (err) {
@@ -870,16 +826,64 @@ app.post("/api/events", verifyJWT, async (req, res) => {
 
 app.get("/api/events", async (req, res) => {
   try {
-    const { clubId } = req.query;
-    const events = await Events.find({ clubId: clubId }).toArray();
-    res.json(events);
+    const {
+      search,
+      clubId,
+      sortBy = "date",
+      sortOrder = "asc",
+      page = 1,
+      limit = 10,
+    } = req.query;
+    let query = {};
+
+    // Add search filter
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { location: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    // Add club filter
+    if (clubId) {
+      query.clubId = clubId;
+    }
+
+    // Build sort object
+    const sortOptions = {};
+    if (sortBy === "date") {
+      sortOptions.date = sortOrder === "asc" ? 1 : -1;
+    } else if (sortBy === "fee") {
+      sortOptions.fee = sortOrder === "asc" ? 1 : -1;
+    } else if (sortBy === "createdAt") {
+      sortOptions.createdAt = sortOrder === "asc" ? 1 : -1;
+    }
+
+    // Pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const events = await Events.find(query)
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .toArray();
+
+    const total = await Events.countDocuments(query);
+
+    res.json({
+      events,
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
   } catch (err) {
     res.status(500).json({ message: "Error fetching events", error: err });
   }
 });
 
 app.get("/api/events/:id", async (req, res) => {
-  console.log(req.params.id);
   try {
     const event = await Events.findOne({ _id: new ObjectId(req.params.id) });
     if (!event) {
@@ -888,24 +892,6 @@ app.get("/api/events/:id", async (req, res) => {
     res.json(event);
   } catch (err) {
     res.status(500).json({ message: "Error fetching event", error: err });
-  }
-});
-
-app.get("/api/club-events/:clubId", verifyJWT, async (req, res) => {
-  try {
-    const { clubId } = req.params;
-
-    const events = await Events.find({
-      clubId: new ObjectId(clubId),
-    }).toArray();
-
-    res.json(events); // even if empty []
-  } catch (err) {
-    console.error("Club Events Error:", err);
-    res.status(500).json({
-      message: "Failed to fetch club events",
-      error: err.message,
-    });
   }
 });
 
