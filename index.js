@@ -339,7 +339,7 @@ app.get(
       return res.status(500).json({ message: "Unauthorized Access" });
     }
     const query = {
-      email: email,
+      status: "pending",
     };
     try {
       const pendingClub = await Clubs.find(query);
@@ -549,4 +549,5 @@ app.post("/api/registrations", verifyJWT, async (req, res) => {
 // --------------------------------------------------
 // START SERVER
 // --------------------------------------------------
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Export the app for serverless deployment
+export default app;
