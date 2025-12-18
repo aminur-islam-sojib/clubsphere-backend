@@ -6,6 +6,41 @@ import dotenv from "dotenv";
 dotenv.config();
 import Stripe from "stripe";
 const stripe = new Stripe(process.env.STRIPE_SECRET);
+import admin from "firebase-admin";
+
+// Initialize Firebase Admin (only if credentials are available)
+let firebaseInitialized = false;
+try {
+  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
+    const serviceAccount = {
+      type: "service_account",
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+      private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      client_id: process.env.FIREBASE_CLIENT_ID,
+      auth_uri: "https://accounts.google.com/o/oauth2/auth",
+      token_uri: "https://oauth2.googleapis.com/token",
+      auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+      client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
+    };
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseInitialized = true;
+    console.log("Firebase Admin initialized successfully");
+  } else {
+    console.log(
+      "Firebase Admin credentials not found, using JWT-only authentication"
+    );
+  }
+} catch (error) {
+  console.log(
+    "Firebase Admin initialization failed, using JWT-only authentication:",
+    error.message
+  );
+}
 
 // --------------------------------------------------
 // CONFIG
@@ -43,6 +78,9 @@ async function dbConnect() {
 }
 dbConnect();
 
+// Export the app for serverless deployment
+export default app;
+
 // --------------------------------------------------
 // JWT MIDDLEWARE
 // --------------------------------------------------
@@ -50,7 +88,6 @@ function verifyJWT(req, res, next) {
   const authHeader = req.headers.authorization;
 
   const users = req.body;
-  console.log(users);
 
   if (!authHeader)
     return res.status(401).json({ message: "Unauthorized: No token provided" });
@@ -67,12 +104,68 @@ function verifyJWT(req, res, next) {
 }
 
 // --------------------------------------------------
+// FIREBASE TOKEN VERIFICATION MIDDLEWARE
+// --------------------------------------------------
+async function verifyFirebaseToken(req, res, next) {
+  try {
+    if (!firebaseInitialized) {
+      // Fall back to JWT verification
+      return verifyJWT(req, res, next);
+    }
+
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .json({ message: "Unauthorized: No Firebase token provided" });
+    }
+
+    const idToken = authHeader.split("Bearer ")[1];
+
+    // Verify Firebase token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+
+    // Get user from database or create if doesn't exist
+    let user = await Users.findOne({ email: decodedToken.email });
+
+    if (!user) {
+      // Auto-create user from Firebase data
+      const newUser = {
+        email: decodedToken.email,
+        name: decodedToken.name || "User",
+        photoURL: decodedToken.picture || "",
+        role: "member",
+        createdAt: new Date(),
+      };
+
+      await Users.insertOne(newUser);
+      user = newUser;
+    }
+
+    req.user = {
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      photoURL: user.photoURL,
+      uid: decodedToken.uid,
+    };
+
+    next();
+  } catch (error) {
+    console.error("Firebase token verification error:", error);
+    // Fall back to JWT verification
+    return verifyJWT(req, res, next);
+  }
+}
+
+// --------------------------------------------------
 // ROLE MIDDLEWARE
 // --------------------------------------------------
 function verifyRole(role) {
   return (req, res, next) => {
     const user = req.user;
-    console.log(user);
+
     if (req.user.role !== role)
       return res.status(403).json({ message: "Access denied" });
     next();
@@ -106,34 +199,239 @@ app.post("/api/create-checkout-session", verifyJWT, async (req, res) => {
     mode: "payment",
     metadata: {
       productId: clubId,
+      type: "membership",
     },
-    success_url: `${YOUR_DOMAIN}/dashboard/payment-success`,
+    success_url: `${YOUR_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${YOUR_DOMAIN}/dashboard/payment-cancel`,
   });
 
-  console.log(session);
   res.send(session.url);
+});
+
+// Event Payment Checkout Session
+app.post("/api/create-event-checkout-session", verifyJWT, async (req, res) => {
+  const { eventTitle, email, fee, eventId, description } = req.body;
+  const amount = parseInt(fee) * 100;
+  const session = await stripe.checkout.sessions.create({
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: amount,
+          product_data: {
+            name: eventTitle,
+            description: description,
+          },
+        },
+        quantity: 1,
+      },
+    ],
+    customer_email: email,
+    mode: "payment",
+    metadata: {
+      productId: eventId,
+      type: "event",
+    },
+    success_url: `${YOUR_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${YOUR_DOMAIN}/dashboard/payment-cancel`,
+  });
+
+  res.send(session.url);
+});
+
+app.patch("/api/payment/verify", verifyJWT, async (req, res) => {
+  try {
+    const { session_id } = req.query;
+
+    if (!session_id) {
+      return res.status(400).json({ message: "Session ID required" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    // 2️⃣ Ensure payment is successful
+    if (session.payment_status !== "paid") {
+      return res.status(400).json({ message: "Payment not completed" });
+    }
+
+    const productId = session.metadata.productId;
+    const paymentType = session.metadata.type || "membership";
+
+    if (paymentType === "membership") {
+      // Handle membership payment
+      const clubId = productId;
+
+      // 3️⃣ Prevent duplicate membership
+      const existingMembership = await Memberships.findOne({
+        userEmail: req.user.email,
+        clubId: new ObjectId(clubId),
+        status: "active",
+      });
+
+      if (existingMembership) {
+        return res.json({
+          message: "Membership already exists",
+          membership: existingMembership,
+        });
+      }
+
+      // 4️⃣ Create membership
+      const membershipDoc = {
+        userEmail: req.user.email,
+        clubId: new ObjectId(clubId),
+        status: "active",
+        paymentId: session.payment_intent,
+        paymentType: "paid",
+        joinedAt: new Date(),
+        expiresAt: null,
+      };
+
+      await Memberships.insertOne(membershipDoc);
+
+      // 5️⃣ Save payment history
+      await Payments.insertOne({
+        userEmail: req.user.email,
+        amount: session.amount_total / 100,
+        type: "membership",
+        clubId: new ObjectId(clubId),
+        stripePaymentIntentId: session.payment_intent,
+        status: "paid",
+        createdAt: new Date(),
+      });
+
+      res.json({
+        message: "Payment verified & membership activated",
+        membership: membershipDoc,
+      });
+    } else if (paymentType === "event") {
+      // Handle event payment
+      const eventId = productId;
+
+      // Check if already registered
+      const existingRegistration = await Registrations.findOne({
+        userEmail: req.user.email,
+        eventId: new ObjectId(eventId),
+        status: "registered",
+      });
+
+      if (existingRegistration) {
+        return res.json({
+          message: "Already registered for this event",
+          registration: existingRegistration,
+        });
+      }
+
+      // Create event registration
+      const registrationDoc = {
+        userEmail: req.user.email,
+        eventId: new ObjectId(eventId),
+        status: "registered",
+        paymentId: session.payment_intent,
+        paymentType: "paid",
+        registeredAt: new Date(),
+      };
+
+      await Registrations.insertOne(registrationDoc);
+
+      // Save payment history
+      await Payments.insertOne({
+        userEmail: req.user.email,
+        amount: session.amount_total / 100,
+        type: "event",
+        eventId: new ObjectId(eventId),
+        stripePaymentIntentId: session.payment_intent,
+        status: "paid",
+        createdAt: new Date(),
+      });
+
+      res.json({
+        message: "Payment verified & event registration completed",
+        registration: registrationDoc,
+      });
+    } else {
+      return res.status(400).json({ message: "Unknown payment type" });
+    }
+  } catch (err) {
+    res
+      .status(500)
+      .json({ message: "Payment verification failed", error: err });
+  }
+});
+app.get("/api/payment-user/:id", verifyJWT, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const clubId = req.params.id;
+
+    const result = await Payments.findOne({
+      userEmail: email,
+      clubId: new ObjectId(clubId),
+    });
+
+    if (!result) {
+      return res.status(404).json({ message: "No payment found" });
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/api/payment-users/:clubId", async (req, res) => {
+  const clubId = req.params.clubId;
+  const query = { clubId: new ObjectId(clubId) };
+
+  const totalUsers = await Payments.countDocuments(query);
+
+  res.json({ totalUsers });
 });
 
 // --------------------------------------------------
 // AUTH API
 // --------------------------------------------------
 app.post("/api/auth/jwt", async (req, res) => {
-  const { email } = req.body;
+  try {
+    const { email, name, photoURL } = req.body;
 
-  const user = await Users.findOne({ email });
+    // Check if user exists, if not create them
+    let user = await Users.findOne({ email });
 
-  if (!user) return res.status(404).json({ message: "User not found" });
+    if (!user) {
+      // Auto-create user from Firebase data
+      const newUser = {
+        email,
+        name: name || "User",
+        photoURL: photoURL || "",
+        role: "member",
+        createdAt: new Date(),
+      };
 
-  const token = jwt.sign(
-    { email: user.email, name: user.name, role: user.role },
-    JWT_SECRET
-  );
+      await Users.insertOne(newUser);
+      user = newUser;
+    }
 
-  return res.json({ token });
+    const token = jwt.sign(
+      {
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        photoURL: user.photoURL,
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    return res.json({ token });
+  } catch (err) {
+    console.error("JWT generation error:", err);
+    return res
+      .status(500)
+      .json({ message: "Error generating token", error: err });
+  }
 });
 
-// Save user to database (without authentication)
+// Save user to database (without authentication) - for manual registration
 app.post("/api/users", async (req, res) => {
   try {
     const { email, name, password } = req.body;
@@ -148,7 +446,7 @@ app.post("/api/users", async (req, res) => {
     const newUser = {
       email,
       name,
-      password,
+      password, // Note: In production, this should be hashed
       role: "member",
       createdAt: new Date(),
     };
@@ -225,19 +523,16 @@ const updateUser = async (req, res, next) => {
     const user = await Users.findOne({ email });
 
     if (!user) {
-      console.log("User not found");
       return next();
     }
 
     // 2. Prevent overwriting admin role
     if (user.role === "admin") {
-      console.log("User is admin — role will not change");
       return next();
     }
 
     // 3. If user is already manager, do not update
     if (user.role === "manager") {
-      console.log("User already manager — no update needed");
       return next();
     }
 
@@ -246,12 +541,10 @@ const updateUser = async (req, res, next) => {
       await Users.updateOne({ email }, { $set: { role: "manager" } });
 
       req.user.role = "manager";
-      console.log("Role updated to manager for", email);
     }
 
     next();
   } catch (error) {
-    console.log("Error updating user role:", error);
     next(error);
   }
 };
@@ -309,22 +602,81 @@ app.post("/api/clubs", verifyJWT, updateUser, async (req, res) => {
 
 app.get("/api/clubs/:email", verifyJWT, async (req, res) => {
   if (req.user.email !== req.params.email) {
-    res.status(500).json({ message: "Unauthorized access!" });
+    return res.status(403).json({ message: "Unauthorized access!" });
   }
   try {
-    const clubs = await Clubs.find({
-      managerEmail: req.params.email,
-    }).toArray();
+    const { search, status } = req.query;
+    let query = { managerEmail: req.params.email };
+
+    // Add status filter if provided
+    if (status && status !== "all") {
+      query.status = status;
+    }
+
+    // Add search filter if provided
+    if (search) {
+      query.$or = [
+        { clubName: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const clubs = await Clubs.find(query).toArray();
     res.json(clubs);
-  } catch (error) {
+  } catch (err) {
     res.status(500).json({ message: "Error fetching clubs", error: err });
   }
 });
-// Public – List Approved Clubs
+// Public – List Approved Clubs with search/filter/sorting
 app.get("/api/clubs", async (req, res) => {
   try {
-    const clubs = await Clubs.find({ status: "approved" }).toArray();
-    res.json(clubs);
+    const {
+      search,
+      category,
+      sortBy = "createdAt",
+      sortOrder = "desc",
+      page = 1,
+      limit = 10,
+    } = req.query;
+    let query = { status: "approved" };
+
+    // Add search filter
+    if (search) {
+      query.$or = [
+        { clubName: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    // Add category filter
+    if (category && category !== "all") {
+      query.category = category;
+    }
+
+    // Build sort object
+    const sortOptions = {};
+    sortOptions[sortBy] = sortOrder === "asc" ? 1 : -1;
+
+    // Pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const clubs = await Clubs.find(query)
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .toArray();
+
+    const total = await Clubs.countDocuments(query);
+
+    res.json({
+      clubs,
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
   } catch (err) {
     res.status(500).json({ message: "Error fetching clubs", error: err });
   }
@@ -388,7 +740,7 @@ app.get(
 );
 
 // Get club details
-app.get("/api/clubs/:id", async (req, res) => {
+app.get("/api/club-details/:id", async (req, res) => {
   try {
     const club = await Clubs.findOne({ _id: new ObjectId(req.params.id) });
     if (!club) {
@@ -434,7 +786,7 @@ app.patch(
 );
 
 // Manager – Update Club
-app.patch("/api/clubs/:id", verifyJWT, async (req, res) => {
+app.patch("/api/club/:id", verifyJWT, async (req, res) => {
   try {
     const club = await Clubs.findOne({ _id: new ObjectId(req.params.id) });
 
@@ -456,6 +808,17 @@ app.patch("/api/clubs/:id", verifyJWT, async (req, res) => {
   }
 });
 
+app.delete("/api/club/:id", verifyJWT, async (req, res) => {
+  try {
+    const club = await Clubs.deleteOne({ _id: new ObjectId(req.params.id) });
+    if (!club) {
+      return res.status(404).json({ message: "Club not found" });
+    }
+    res.json(club);
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching club", error: err });
+  }
+});
 // --------------------------------------------------
 // MEMBERSHIP API
 // --------------------------------------------------
@@ -495,8 +858,9 @@ app.post("/api/events", verifyJWT, async (req, res) => {
     const event = {
       ...req.body,
       createdAt: new Date(),
+      clubId: new ObjectId(req.body.clubId),
     };
-
+    console.log(event);
     await Events.insertOne(event);
     res.json({ message: "Event created!" });
   } catch (err) {
@@ -506,7 +870,8 @@ app.post("/api/events", verifyJWT, async (req, res) => {
 
 app.get("/api/events", async (req, res) => {
   try {
-    const events = await Events.find().toArray();
+    const { clubId } = req.query;
+    const events = await Events.find({ clubId: clubId }).toArray();
     res.json(events);
   } catch (err) {
     res.status(500).json({ message: "Error fetching events", error: err });
@@ -514,6 +879,7 @@ app.get("/api/events", async (req, res) => {
 });
 
 app.get("/api/events/:id", async (req, res) => {
+  console.log(req.params.id);
   try {
     const event = await Events.findOne({ _id: new ObjectId(req.params.id) });
     if (!event) {
@@ -525,16 +891,70 @@ app.get("/api/events/:id", async (req, res) => {
   }
 });
 
+app.get("/api/club-events/:clubId", verifyJWT, async (req, res) => {
+  try {
+    const { clubId } = req.params;
+
+    const events = await Events.find({
+      clubId: new ObjectId(clubId),
+    }).toArray();
+
+    res.json(events); // even if empty []
+  } catch (err) {
+    console.error("Club Events Error:", err);
+    res.status(500).json({
+      message: "Failed to fetch club events",
+      error: err.message,
+    });
+  }
+});
+
 // --------------------------------------------------
 // EVENT REGISTRATION
 // --------------------------------------------------
 app.post("/api/registrations", verifyJWT, async (req, res) => {
   try {
+    const { eventId } = req.body;
+
+    // Check if event exists and get its details
+    const event = await Events.findOne({ _id: new ObjectId(eventId) });
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Check if already registered
+    const existingRegistration = await Registrations.findOne({
+      userEmail: req.user.email,
+      eventId: new ObjectId(eventId),
+    });
+
+    if (existingRegistration) {
+      return res
+        .status(409)
+        .json({ message: "Already registered for this event" });
+    }
+
+    // If event has a fee, require payment
+    if (event.fee && event.fee > 0) {
+      return res.status(402).json({
+        message: "Payment required for this event",
+        requiresPayment: true,
+        event: {
+          id: event._id,
+          title: event.title,
+          fee: event.fee,
+          description: event.description,
+        },
+      });
+    }
+
+    // Free event - register directly
     const reg = {
-      ...req.body,
+      eventId: new ObjectId(eventId),
       userEmail: req.user.email,
       registeredAt: new Date(),
       status: "registered",
+      paymentType: "free",
     };
 
     await Registrations.insertOne(reg);
@@ -547,7 +967,106 @@ app.post("/api/registrations", verifyJWT, async (req, res) => {
 });
 
 // --------------------------------------------------
-// START SERVER
+// DASHBOARD ANALYTICS
 // --------------------------------------------------
-// Export the app for serverless deployment
-export default app;
+app.get("/api/analytics/dashboard", verifyJWT, async (req, res) => {
+  try {
+    const userEmail = req.user.email;
+    const userRole = req.user.role;
+
+    let analytics = {};
+
+    if (userRole === "admin") {
+      // Admin analytics
+      const totalUsers = await Users.countDocuments();
+      const totalClubs = await Clubs.countDocuments();
+      const approvedClubs = await Clubs.countDocuments({ status: "approved" });
+      const pendingClubs = await Clubs.countDocuments({ status: "pending" });
+      const totalEvents = await Events.countDocuments();
+      const totalPayments = await Payments.aggregate([
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]).toArray();
+
+      const monthlyRevenue = await Payments.aggregate([
+        {
+          $group: {
+            _id: {
+              year: { $year: "$createdAt" },
+              month: { $month: "$createdAt" },
+            },
+            revenue: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { "_id.year": -1, "_id.month": -1 } },
+        { $limit: 12 },
+      ]).toArray();
+
+      analytics = {
+        totalUsers,
+        totalClubs,
+        approvedClubs,
+        pendingClubs,
+        totalEvents,
+        totalRevenue: totalPayments[0]?.total || 0,
+        monthlyRevenue,
+      };
+    } else if (userRole === "manager") {
+      // Manager analytics
+      const userClubs = await Clubs.find({ managerEmail: userEmail }).toArray();
+      const clubIds = userClubs.map((club) => club._id);
+
+      const clubMemberships = await Memberships.countDocuments({
+        clubId: { $in: clubIds },
+        status: "active",
+      });
+
+      const clubEvents = await Events.find({
+        clubId: { $in: clubIds },
+      }).toArray();
+      const eventIds = clubEvents.map((event) => event._id);
+
+      const eventRegistrations = await Registrations.countDocuments({
+        eventId: { $in: eventIds },
+      });
+
+      const clubRevenue = await Payments.aggregate([
+        { $match: { clubId: { $in: clubIds } } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]).toArray();
+
+      analytics = {
+        myClubs: userClubs.length,
+        totalMembers: clubMemberships,
+        totalEvents: clubEvents.length,
+        totalRegistrations: eventRegistrations,
+        totalRevenue: clubRevenue[0]?.total || 0,
+      };
+    } else {
+      // Member analytics
+      const userMemberships = await Memberships.countDocuments({
+        userEmail: userEmail,
+        status: "active",
+      });
+
+      const userRegistrations = await Registrations.countDocuments({
+        userEmail: userEmail,
+      });
+
+      const userPayments = await Payments.aggregate([
+        { $match: { userEmail: userEmail } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]).toArray();
+
+      analytics = {
+        myMemberships: userMemberships,
+        myRegistrations: userRegistrations,
+        totalSpent: userPayments[0]?.total || 0,
+      };
+    }
+
+    res.json(analytics);
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching analytics", error: err });
+  }
+});
