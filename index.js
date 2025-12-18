@@ -61,7 +61,7 @@ let Users, Clubs, Memberships, Events, Registrations, Payments;
 
 async function dbConnect() {
   try {
-    await client.connect();
+    // await client.connect();
     const db = client.db("clubsphereDB");
 
     Users = db.collection("users");
