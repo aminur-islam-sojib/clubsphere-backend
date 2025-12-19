@@ -27,7 +27,7 @@ let Users, Clubs, Memberships, Events, Registrations, Payments;
 
 async function dbConnect() {
   try {
-    await client.connect();
+    // await client.connect();
     const db = client.db("clubsphereDB");
 
     Users = db.collection("users");
@@ -649,6 +649,18 @@ app.get("/api/clubs", async (req, res) => {
     res.status(500).json({ message: "Error fetching clubs", error: err });
   }
 });
+app.get("/api/manager/club-stats", async (req, res) => {
+  const stats = await Payments.aggregate([
+    {
+      $group: {
+        _id: "$clubId",
+        totalUsers: { $sum: 1 },
+      },
+    },
+  ]).toArray();
+
+  res.json(stats);
+});
 
 app.get(
   "/api/clubs/pending/:email",
@@ -886,6 +898,19 @@ app.get("/api/events", async (req, res) => {
 app.get("/api/events/:id", async (req, res) => {
   try {
     const event = await Events.findOne({ _id: new ObjectId(req.params.id) });
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+    res.json(event);
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching event", error: err });
+  }
+});
+
+app.get("/api/club-events/:clubId", async (req, res) => {
+  const clubId = req.params.clubId;
+  try {
+    const event = await Events.find({ clubId: clubId }).toArray();
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
     }
